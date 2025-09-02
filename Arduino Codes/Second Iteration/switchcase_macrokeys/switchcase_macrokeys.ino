@@ -1,20 +1,41 @@
 /*
-  Macro Keyboard (Leonardo/Pro Micro) — low-RAM build
-  - JSON config lives in EEPROM; parsed on-demand (no big doc kept in RAM)
-  - Hold Mode button (A1) on boot to enter CONFIG MODE (Serial 115200):
-      GET           -> prints JSON from EEPROM
-      PUT <len>\n   -> stream exactly <len> JSON bytes; device stores + CRC
-      RESET         -> restore factory JSON
+  Macro Keyboard (Leonardo/Pro Micro) — Hybrid Host-Push Config
+  --------------------------------------------------------------
+  - On boot: prints "READY" at 115200 and waits for PC to push config.
+    Protocol:
+      "BINCFG <len>\n"  followed by <len> raw bytes
+    Use the provided Python:  python send_packed.py COM13 config.json
+    (It compacts your JSON and sends the binary.)
+
+  - Config is kept in RAM (K/E/Dict). No EEPROM used, no size limits.
+  - If nothing arrives within a timeout, a small built-in default is loaded.
+
+  Requires libraries:
+    - HID-Project
+    - Keypad
+    - Encoder
+
+  Hardware (from your original):
+    - Matrix rows: D0, D2, D3, D4
+    - Matrix cols: D5, D6, D7, D8
+    - Encoders: A: D18, D15   B: D14, D16
+    - Mode button: A1 (D19)
+    - LEDs: Mode1 D9, Mode2 D10, LedArd1 D17, LedArd2 D30
+    - Potentiometer: A2
+
+  Actions supported:
+    - Chords: "CTRL+...", "ALT", "SHIFT", "GUI/WIN", letters A..Z, F1..F12, arrows, PAGE_UP/DOWN, ENTER/RETURN
+    - Consumer: "CONSUMER:MEDIA_VOLUME_UP|DOWN|MUTE|NEXT|PREVIOUS|MEDIA_PLAY_PAUSE|CONSUMER_BROWSER_BACK|CONSUMER_BROWSER_FORWARD"
+    - Text: "TEXT:hello world"
+    - Sequences: 'SEQ:["CTRL+k","c"]'  or 'SEQ:["ENTER","TEXT:XD"]'
 */
 
 #include <Arduino.h>
-#include <EEPROM.h>
-#include <ArduinoJson.h>
 #include "HID-Project.h"
 #include <Keypad.h>
 #include <Encoder.h>
 
-// -------------------- Hardware (your original) --------------------
+// -------------------- Hardware --------------------
 Encoder RotaryEncoderA(18, 15); // LEFT encoder (A)
 Encoder RotaryEncoderB(14, 16); // RIGHT encoder (B)
 
@@ -34,7 +55,7 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 int modePushCounter = 0;
 int buttonState = 0, lastButtonState = 0;
-const int ModeButton = A1;
+const int ModeButton = A1;   // 19
 
 const int Mode1 = 9;
 const int Mode2 = 10;
@@ -44,127 +65,112 @@ const int Potenziometro = A2;
 int ValorePot = 0;
 int lum = 0;
 
-// -------------------- Config storage (tiny) --------------------
-struct EepromHeader {
-  uint32_t magic;     // 0xDEADBEEF
+// -------------------- RAM config (host-pushed) --------------------
+#define CFG_MAGIC 0x42434647UL /* 'BCFG' */
+
+// Binary header sent by PC
+struct PackedHeader {
+  uint32_t magic;     // 'BCFG'
   uint16_t version;   // 1
-  uint16_t jsonLen;   // bytes of JSON payload
-  uint32_t crc;       // CRC32 of JSON payload
+  uint16_t dictCount; // number of strings
 };
 
-static const uint32_t CFG_MAGIC   = 0xDEADBEEF;
-static const uint16_t CFG_VERSION = 1;
+// Key/encoder maps:
+//   K: 4 modes × 16 keys (fixed order 0..9,A..F). Each cell is index into Dict, or 0xFF for none.
+//   Emap: 4 modes × 4 encoder slots [A+, A-, B+, B-], same indexing.
+static uint8_t K[4][16];
+static uint8_t Emap[4][4];
 
-// Derive EEPROM size when available
-#ifndef EEPROM_SIZE
-  #ifdef E2END
-    #define EEPROM_SIZE (E2END + 1)
-  #else
-    #define EEPROM_SIZE 1024
-  #endif
-#endif
+// Action dictionary: pointers into a single string pool we own.
+static const char* Dict[128];     // up to 128 unique strings; increase if needed
+static char* strPool = nullptr;   // allocated buffer holding all strings (NUL-separated)
+static uint16_t dictCount = 0;
 
-// We keep JSON modest so it fits 1KB EEPROM with header
-static const uint16_t MAX_JSON = EEPROM_SIZE - sizeof(EepromHeader);
-
-// CRC32 (table-less)
-static uint32_t crc32_update(uint32_t crc, uint8_t data) {
-  crc ^= data;
-  for (uint8_t i=0;i<8;i++) crc = (crc >> 1) ^ (0xEDB88320 & (-(int32_t)(crc & 1)));
-  return crc;
+static void freeConfigPool() {
+  if (strPool) { free(strPool); strPool = nullptr; }
+  for (uint16_t i=0;i<sizeof(Dict)/sizeof(Dict[0]);i++) Dict[i] = nullptr;
+  dictCount = 0;
 }
-static uint32_t crc32_eeprom(uint16_t addr, uint16_t len) {
-  uint32_t c = ~0U;
-  for (uint16_t i=0;i<len;i++) c = crc32_update(c, EEPROM.read(addr + i));
-  return ~c;
-}
-static uint32_t crc32_stream(Stream &s, uint16_t len) {
-  uint32_t c = ~0U;
-  for (uint16_t i=0;i<len;i++) {
-    while (!s.available()) { /* wait */ }
-    c = crc32_update(c, (uint8_t)s.read());
+
+// Apply packed binary buffer (received from PC) into RAM structures
+static bool applyPackedConfig(const uint8_t* buf, size_t len) {
+  freeConfigPool();
+
+  if (len < sizeof(PackedHeader) + sizeof(K) + sizeof(Emap)) return false;
+  const PackedHeader* h = (const PackedHeader*)buf;
+  if (h->magic != CFG_MAGIC || h->version != 1) return false;
+
+  size_t off = sizeof(PackedHeader);
+  memcpy(K, buf + off, sizeof(K));    off += sizeof(K);
+  memcpy(Emap, buf + off, sizeof(Emap)); off += sizeof(Emap);
+
+  dictCount = h->dictCount;
+  if (dictCount > (uint16_t)(sizeof(Dict)/sizeof(Dict[0]))) return false;
+
+  // remaining bytes = concatenated zero-terminated UTF-8 strings
+  if (off > len) return false;
+  size_t poolLen = len - off;
+  strPool = (char*)malloc(poolLen + 1);
+  if (!strPool) return false;
+  memcpy(strPool, buf + off, poolLen);
+  strPool[poolLen] = 0;
+
+  // Build Dict[] pointers by walking the pool
+  char* p = strPool;
+  for (uint16_t i = 0; i < dictCount; i++) {
+    Dict[i] = p;
+    while (*p) p++;
+    p++; // skip NUL
+    if ((size_t)(p - strPool) > poolLen + 1) return false;
   }
-  return ~c;
-}
-
-// Factory JSON kept in PROGMEM (flash), not SRAM
-const char factoryJson[] PROGMEM = R"json(
-{"version":1,
- "keys":{
-  "0":{"0":"CTRL+c","1":"CTRL+x","2":"CTRL+f","3":"F5","4":"CTRL+PAGE_UP","5":"CTRL+PAGE_DOWN","6":"CTRL+w","7":"CTRL+t","8":"CONSUMER:CONSUMER_BROWSER_BACK","9":"CONSUMER:CONSUMER_BROWSER_FORWARD","A":"CTRL+v","B":"CTRL+a","C":"TEXT:Alpha key12","D":"CTRL+s","E":"CONSUMER:MEDIA_VOLUME_MUTE","F":"CONSUMER:MEDIA_PLAY_PAUSE"},
-  "1":{"0":"CTRL+c","1":"CTRL+V","A":"CTRL+ALT+SHIFT+v","B":"CTRL+ALT+SHIFT+ENTER","C":"SEQ:[\"CTRL+ALT+SHIFT+BACKSPACE\",\"RIGHT\",\"DOWN\",\"RIGHT\",\"DOWN\",\"ENTER\"]","E":"ENTER","F":"ENTER"},
-  "2":{"9":"CTRL+ALT+i","A":"CTRL+ALT+SHIFT+w"},
-  "3":{"0":"CTRL+SHIFT+F9","1":"TEXT:nice shot","2":"SEQ:[\"CTRL+k\",\"c\"]","3":"SEQ:[\"CTRL+k\",\"u\"]","4":"TEXT:thanks","5":"TEXT:i got it","6":"TEXT:take the shot","7":"TEXT:defending","8":"SEQ:[\"CTRL+k\",\"k\"]","9":"SEQ:[\"CTRL+k\",\"l\"]","A":"SEQ:[\"CTRL+k\",\"c\"]","B":"TEXT:my bad","C":"TEXT:nooooo!","D":"TEXT:close one","E":"TEXT:230998","F":"SEQ:[\"ENTER\",\"TEXT:XD\"]"}
- },
- "encoders":{
-  "0":{"A+":"CONSUMER:MEDIA_VOLUME_DOWN","A-":"CONSUMER:MEDIA_VOLUME_UP","B+":"CONSUMER:MEDIA_PREVIOUS","B-":"CONSUMER:MEDIA_NEXT"},
-  "1":{"A+":"LEFT","A-":"RIGHT","B+":"UP","B-":"DOWN"},
-  "2":{"A+":"LEFT","A-":"RIGHT","B+":"LEFT","B-":"RIGHT"},
-  "3":{"A+":"DOWN","A-":"UP","B+":"DOWN","B-":"UP"}
- }}
-)json";
-
-// Length of factoryJson in flash
-static uint16_t factoryLen() {
-  // compute strlen_P
-  uint16_t n=0; while (pgm_read_byte(factoryJson + n) != 0) n++; return n;
-}
-
-// Write factory to EEPROM (streamed, no RAM copy)
-static bool installFactoryToEEPROM() {
-  EepromHeader h;
-  h.magic = CFG_MAGIC;
-  h.version = CFG_VERSION;
-  h.jsonLen = factoryLen();
-  if (h.jsonLen == 0 || h.jsonLen > MAX_JSON) return false;
-
-  // write payload first (after header)
-  for (uint16_t i=0;i<h.jsonLen;i++) {
-    uint8_t b = pgm_read_byte(factoryJson + i);
-    EEPROM.update(sizeof(EepromHeader) + i, b);
-  }
-  h.crc = crc32_eeprom(sizeof(EepromHeader), h.jsonLen);
-
-  // write header last
-  const uint8_t* p = (const uint8_t*)&h;
-  for (uint16_t i=0;i<sizeof(EepromHeader);i++) EEPROM.update(i, p[i]);
   return true;
 }
 
-// Validate header & CRC
-static bool hasValidConfig(EepromHeader &out) {
-  EepromHeader h;
-  for (uint16_t i=0;i<sizeof(EepromHeader);i++) ((uint8_t*)&h)[i] = EEPROM.read(i);
-  if (h.magic != CFG_MAGIC || h.version != CFG_VERSION) return false;
-  if (h.jsonLen == 0 || h.jsonLen > MAX_JSON) return false;
-  uint32_t crc = crc32_eeprom(sizeof(EepromHeader), h.jsonLen);
-  if (crc != h.crc) return false;
-  out = h;
-  return true;
+// Wait briefly at boot for host to push a config
+static bool waitForHostConfig(unsigned long ms_timeout = 6000) {
+  Serial.begin(115200);
+  unsigned long t0 = millis();
+  while (!Serial && (millis() - t0) < 1500) { /* wait for USB */ }
+  Serial.println(F("READY")); // host looks for this banner
+
+  // Expect a line: BINCFG <len>\n  then <len> raw bytes
+  String line;
+  while (millis() - t0 < ms_timeout) {
+    while (Serial.available()) {
+      char c = (char)Serial.read();
+      if (c == '\n') {
+        line.trim();
+        if (line.startsWith("BINCFG")) {
+          int sp = line.indexOf(' ');
+          if (sp < 0) { Serial.println(F("ERR len")); return false; }
+          int n = line.substring(sp+1).toInt();
+          if (n <= 0 || n > 8192) { Serial.println(F("ERR badlen")); return false; }
+          uint8_t* buf = (uint8_t*)malloc(n);
+          if (!buf) { Serial.println(F("ERR mem")); return false; }
+          int got = 0; unsigned long to = millis()+4000;
+          while (got < n && millis() < to) {
+            if (Serial.available()) { buf[got++] = (uint8_t)Serial.read(); to = millis()+4000; }
+          }
+          if (got != n) { Serial.println(F("ERR timeout")); free(buf); return false; }
+
+          bool ok = applyPackedConfig(buf, (size_t)n);
+          free(buf);
+          Serial.println(ok ? F("SAVED") : F("ERR parse"));
+          return ok;
+        } else {
+          Serial.println(F("UNKNOWN"));
+          line = "";
+        }
+      } else {
+        line += c;
+      }
+    }
+    if (millis() - t0 > ms_timeout) break;
+  }
+  return false; // nothing received
 }
 
-// -------------------- EEPROM stream for ArduinoJson --------------------
-class EEPROMRangeStream : public Stream {
-public:
-  EEPROMRangeStream(uint16_t start, uint16_t len) : _start(start), _len(len), _pos(0) {}
-  int available() override { return (_pos < _len) ? 1 : 0; }
-  int read() override {
-    if (_pos >= _len) return -1;
-    int v = EEPROM.read(_start + _pos);
-    _pos++;
-    return v;
-  }
-  int peek() override {
-    if (_pos >= _len) return -1;
-    return EEPROM.read(_start + _pos);
-  }
-  void flush() override {}
-  size_t write(uint8_t) override { return 0; }
-private:
-  uint16_t _start, _len, _pos;
-};
-
-// -------------------- Action runner (compact) --------------------
+// -------------------- Action runner --------------------
 static uint8_t mapKeyToken(const String& t) {
   String s = t; s.toUpperCase();
   if (s.length()==1) { char c = s[0]; if (c>='A' && c<='Z') return (uint8_t)c; }
@@ -242,127 +248,33 @@ static void runAction(const String& spec) {
   runSingleAction(s);
 }
 
-// -------------------- On-demand JSON lookup --------------------
-// We parse only one string value at a time from EEPROM JSON using a filter,
-// so the JsonDocument can be tiny (<= 128 bytes).
-static bool readJsonStringPath(char* out, size_t outLen,
-                               const char* path0, const char* path1,
-                               const char* path2, const char* path3) {
-  EepromHeader h;
-  if (!hasValidConfig(h)) return false;
-  EEPROMRangeStream js(sizeof(EepromHeader), h.jsonLen);
-
-  // Build a filter that keeps only the requested leaf
-  // Example for keys: filter["keys"][mode][key] = true
-  StaticJsonDocument<96> filter;
-  JsonVariant f = filter.to<JsonVariant>();
-  if (path0) f = f[path0];
-  if (path1) f = f[path1];
-  if (path2) f = f[path2];
-  if (path3) f = f[path3];
-  f.set(true);
-
-  // We only need a very small doc since only one value is kept
-  StaticJsonDocument<128> doc;
-  DeserializationError err = deserializeJson(doc, js, DeserializationOption::Filter(filter));
-  if (err) return false;
-
-  JsonVariant v = doc;
-  if (path0) v = v[path0];
-  if (path1) v = v[path1];
-  if (path2) v = v[path2];
-  if (path3) v = v[path3];
-
-  if (v.is<const char*>()) {
-    const char* s = v.as<const char*>();
-    strlcpy(out, s, outLen);
-    return true;
-  }
-  return false;
+// -------------------- Resolve actions from RAM maps --------------------
+static int keyLabelToIndex(char label) {
+  if (label >= '0' && label <= '9') return label - '0';
+  if (label >= 'A' && label <= 'F') return 10 + (label - 'A');
+  if (label >= 'a' && label <= 'f') return 10 + (label - 'a');
+  return -1;
 }
-
+static const char* dictAt(uint8_t idx) {
+  return (idx != 0xFF && idx < dictCount) ? Dict[idx] : nullptr;
+}
 static String getKeyAction(uint8_t mode, char keyLabel) {
-  char buf[64]; // plenty for our action strings
-  char modeStr[2] = { char('0' + mode), 0 };
-  char keyStr[2]  = { keyLabel, 0 };
-  if (readJsonStringPath(buf, sizeof(buf), "keys", modeStr, keyStr, nullptr)) return String(buf);
-  return String("");
+  int ix = keyLabelToIndex(keyLabel);
+  if (ix < 0) return String("");
+  const char* s = dictAt(K[mode][ix]);
+  return s ? String(s) : String("");
 }
-
 static String getEncoderAction(uint8_t mode, const char* which) {
-  char buf[48];
-  char modeStr[2] = { char('0' + mode), 0 };
-  if (readJsonStringPath(buf, sizeof(buf), "encoders", modeStr, which, nullptr)) return String(buf);
-  return String("");
+  int slot = (which[0]=='A' && which[1]=='+') ? 0 :
+             (which[0]=='A' && which[1]=='-') ? 1 :
+             (which[0]=='B' && which[1]=='+') ? 2 :
+             (which[0]=='B' && which[1]=='-') ? 3 : -1;
+  if (slot < 0) return String("");
+  const char* s = dictAt(Emap[mode][slot]);
+  return s ? String(s) : String("");
 }
 
-// -------------------- Config-mode CLI (streaming) --------------------
-static bool configMode = false;
-
-static void enterConfigModeIfHeld() {
-  pinMode(ModeButton, INPUT_PULLUP);
-  delay(10);
-  if (digitalRead(ModeButton) == LOW) configMode = true;
-}
-
-// Print JSON from EEPROM without copying into RAM
-static void cmdGET() {
-  EepromHeader h;
-  if (!hasValidConfig(h)) { Serial.println(F("ERR no config")); return; }
-  for (uint16_t i=0;i<h.jsonLen;i++) {
-    Serial.write(EEPROM.read(sizeof(EepromHeader)+i));
-  }
-  Serial.println();
-}
-
-static void cmdPUT(uint16_t len) {
-  if (len==0 || len > MAX_JSON) { Serial.println(F("ERR badlen")); return; }
-  // Write payload first while computing CRC from Serial
-  uint32_t c = ~0U;
-  for (uint16_t i=0;i<len;i++) {
-    // wait for data
-    while (!Serial.available()) {}
-    uint8_t b = (uint8_t)Serial.read();
-    EEPROM.update(sizeof(EepromHeader) + i, b);
-    c = crc32_update(c, b);
-  }
-  c = ~c;
-
-  EepromHeader h;
-  h.magic   = CFG_MAGIC;
-  h.version = CFG_VERSION;
-  h.jsonLen = len;
-  h.crc     = c;
-
-  const uint8_t* p = (const uint8_t*)&h;
-  for (uint16_t i=0;i<sizeof(EepromHeader);i++) EEPROM.update(i, p[i]);
-
-  Serial.println(F("SAVED"));
-}
-
-static void cmdRESET() {
-  if (installFactoryToEEPROM()) Serial.println(F("RESET OK"));
-  else Serial.println(F("ERR reset"));
-}
-
-static void configCLI() {
-  Serial.begin(115200);
-  unsigned long startWait = millis();
-  while (!Serial && millis()-startWait < 3000) {}
-  Serial.println(F("CONFIG MODE"));
-  Serial.println(F("Commands: GET | PUT <len> | RESET"));
-  for (;;) {
-    if (Serial.available()) {
-      String cmd = Serial.readStringUntil('\n'); cmd.trim();
-      if (cmd.startsWith("GET"))       cmdGET();
-      else if (cmd.startsWith("PUT"))  { int sp=cmd.indexOf(' '); if (sp<0){Serial.println(F("ERR len"));} else cmdPUT(cmd.substring(sp+1).toInt()); }
-      else if (cmd.startsWith("RESET")) cmdRESET();
-      else Serial.println(F("UNKNOWN"));
-    }
-  }
-}
-
-// -------------------- Your original helpers w/ config --------------------
+// -------------------- Original helpers --------------------
 static void checkModeButton(){
   buttonState = digitalRead(ModeButton);
   if (buttonState != lastButtonState) {
@@ -400,13 +312,44 @@ static void handleKey(char key) {
   if (act.length()) { runAction(act); delay(80); Keyboard.releaseAll(); }
 }
 
+// -------------------- Tiny fallback (if host didn't send) --------------------
+// This is intentionally tiny so RAM stays low. Adjust if you want defaults.
+static void loadFallbackDefaults() {
+  // Clear maps
+  for (uint8_t m=0;m<4;m++){ for(uint8_t i=0;i<16;i++) K[m][i]=0xFF; for(uint8_t s=0;s<4;s++) Emap[m][s]=0xFF; }
+
+  // Very small dict (expand if you like)
+  static const char* d[] = {
+    "CTRL+c","CTRL+x","CTRL+f","F5","CTRL+v","ENTER",
+    "CONSUMER:MEDIA_VOLUME_UP","CONSUMER:MEDIA_VOLUME_DOWN"
+  };
+  for (uint8_t i=0;i<sizeof(d)/sizeof(d[0]);i++) Dict[i]=d[i];
+  dictCount = sizeof(d)/sizeof(d[0]);
+
+  // Mode 0 a few examples
+  K[0][0] = 0; // '0' -> CTRL+c
+  K[0][1] = 1; // '1' -> CTRL+x
+  K[0][2] = 2; // '2' -> CTRL+f
+  K[0][3] = 3; // '3' -> F5
+  K[0][10] = 4; // 'A' -> CTRL+v
+  K[1][15] = 5; // mode1 'F' -> ENTER
+
+  Emap[0][0] = 7; // mode0 A+ -> VOL DOWN
+  Emap[0][1] = 6; // mode0 A- -> VOL UP
+}
+
 // -------------------- Setup / Loop --------------------
 void setup() {
-  enterConfigModeIfHeld();
-  if (configMode) { configCLI(); } // never returns
-
-  Serial.begin(9600);
+  // Option: require the host only when holding the Mode button:
   pinMode(ModeButton, INPUT_PULLUP);
+  bool got = false;
+  if (digitalRead(ModeButton) == LOW) {
+    got = waitForHostConfig(10000); // wait longer if button held
+  } else {
+    got = waitForHostConfig(3000);  // short wait otherwise
+  }
+
+  // Init hardware
   pinMode(LED_BUILTIN,OUTPUT);
   pinMode(LedArd1, OUTPUT); digitalWrite(LedArd1, HIGH);
   pinMode(LedArd2, OUTPUT); digitalWrite(LedArd2,HIGH);
@@ -416,9 +359,10 @@ void setup() {
   Consumer.begin();
   Mouse.begin();
 
-  // Ensure there's a valid config in EEPROM
-  EepromHeader h;
-  if (!hasValidConfig(h)) installFactoryToEEPROM();
+  if (!got || dictCount == 0) {
+    // No host config received -> minimal defaults
+    loadFallbackDefaults();
+  }
 }
 
 void loop() {
