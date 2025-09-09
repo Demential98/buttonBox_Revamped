@@ -1,5 +1,17 @@
 {
   "version": 1,
+  "pins": {
+    "rows": [14, 27, 26, 25],
+    "cols": [4, 16, 17, 5],
+    "encA": [18, 19],
+    "encB": [23, 22],
+    "modeButton": 21,
+    "ledMode1": 15,
+    "ledMode2": 2,
+    "ledArd1": 12,
+    "ledArd2": 13,
+    "pot": -1
+  },
   "keys": {
     "0": {
       "0": "CTRL+c",
@@ -58,3 +70,4 @@
     "3": { "A+": "DOWN", "A-": "UP", "B+": "DOWN", "B-": "UP" }
   }
 }
+

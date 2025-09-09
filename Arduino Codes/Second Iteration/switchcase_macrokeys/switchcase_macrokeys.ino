@@ -1,30 +1,22 @@
 /*
-  Macro Keyboard (Leonardo/Pro Micro) — Hybrid Host-Push Config
-  --------------------------------------------------------------
-  - On boot: prints "READY" at 115200 and waits for PC to push config.
-    Protocol:
-      "BINCFG <len>\n"  followed by <len> raw bytes
-    Use the provided Python:  python send_packed.py COM13 config.json
-    (It compacts your JSON and sends the binary.)
+  Macro Keyboard (Leonardo/Pro Micro) — Host-Push Config + Built-in Defaults
+  --------------------------------------------------------------------------
+  - On boot: prints "READY" @115200 and waits briefly for host:
+        "BINCFG <len>\n"  then <len> packed bytes (header + maps + string pool)
+  - If received & valid, uses RAM config. Otherwise, uses PROGMEM defaults.
+  - No EEPROM/Flash writes; config only in RAM (host-pushed) or PROGMEM (fallback).
+  - Libraries: HID-Project, Keypad, Encoder
 
-  - Config is kept in RAM (K/E/Dict). No EEPROM used, no size limits.
-  - If nothing arrives within a timeout, a small built-in default is loaded.
+  Wiring (as your original):
+    Rows: D0, D2, D3, D4
+    Cols: D5, D6, D7, D8
+    Enc A: D18, D15   Enc B: D14, D16
+    Mode btn: A1 (D19)
+    LEDs: Mode1 D9, Mode2 D10, LedArd1 D17, LedArd2 D30
+    Pot: A2
 
-  Requires libraries:
-    - HID-Project
-    - Keypad
-    - Encoder
-
-  Hardware (from your original):
-    - Matrix rows: D0, D2, D3, D4
-    - Matrix cols: D5, D6, D7, D8
-    - Encoders: A: D18, D15   B: D14, D16
-    - Mode button: A1 (D19)
-    - LEDs: Mode1 D9, Mode2 D10, LedArd1 D17, LedArd2 D30
-    - Potentiometer: A2
-
-  Actions supported:
-    - Chords: "CTRL+...", "ALT", "SHIFT", "GUI/WIN", letters A..Z, F1..F12, arrows, PAGE_UP/DOWN, ENTER/RETURN
+  Supported actions (strings in dictionary / JSON / packed):
+    - Chords: "CTRL+...", "ALT", "SHIFT", "GUI/WIN", A..Z, F1..F12, arrows, PAGE_UP/DOWN, ENTER/RETURN
     - Consumer: "CONSUMER:MEDIA_VOLUME_UP|DOWN|MUTE|NEXT|PREVIOUS|MEDIA_PLAY_PAUSE|CONSUMER_BROWSER_BACK|CONSUMER_BROWSER_FORWARD"
     - Text: "TEXT:hello world"
     - Sequences: 'SEQ:["CTRL+k","c"]'  or 'SEQ:["ENTER","TEXT:XD"]'
@@ -35,7 +27,7 @@
 #include <Keypad.h>
 #include <Encoder.h>
 
-// -------------------- Hardware --------------------
+// ============================= Hardware =============================
 Encoder RotaryEncoderA(18, 15); // LEFT encoder (A)
 Encoder RotaryEncoderB(14, 16); // RIGHT encoder (B)
 
@@ -65,36 +57,117 @@ const int Potenziometro = A2;
 int ValorePot = 0;
 int lum = 0;
 
-// -------------------- RAM config (host-pushed) --------------------
+// ===================== Packed config format (host) =====================
 #define CFG_MAGIC 0x42434647UL /* 'BCFG' */
-
-// Binary header sent by PC
 struct PackedHeader {
   uint32_t magic;     // 'BCFG'
   uint16_t version;   // 1
   uint16_t dictCount; // number of strings
 };
 
-// Key/encoder maps:
-//   K: 4 modes × 16 keys (fixed order 0..9,A..F). Each cell is index into Dict, or 0xFF for none.
-//   Emap: 4 modes × 4 encoder slots [A+, A-, B+, B-], same indexing.
+// Runtime maps (RAM). Values are indices into dictionary (0..dictCount-1) or 0xFF for none.
 static uint8_t K[4][16];
 static uint8_t Emap[4][4];
 
-// Action dictionary: pointers into a single string pool we own.
-static const char* Dict[128];     // up to 128 unique strings; increase if needed
-static char* strPool = nullptr;   // allocated buffer holding all strings (NUL-separated)
+// --------- Host (RAM) dictionary state ---------
+static const char* DictRAM[128];     // pointers into strPool (set only when host config arrives)
+static char* strPool = nullptr;      // malloc'ed pool for host config strings
 static uint16_t dictCount = 0;
+static bool hostConfigLoaded = false;
 
-static void freeConfigPool() {
+static void freeHostPool() {
   if (strPool) { free(strPool); strPool = nullptr; }
-  for (uint16_t i=0;i<sizeof(Dict)/sizeof(Dict[0]);i++) Dict[i] = nullptr;
+  for (uint8_t i=0;i<128;i++) DictRAM[i] = nullptr;
   dictCount = 0;
+  hostConfigLoaded = false;
 }
 
-// Apply packed binary buffer (received from PC) into RAM structures
+// ===================== Built-in default (PROGMEM) =====================
+// Dict entries (46). Stored as separate PROGMEM strings to avoid big RAM usage.
+#define DSTR(n, s) static const char d_##n[] PROGMEM = s;
+DSTR(0,  "CONSUMER:CONSUMER_BROWSER_BACK")
+DSTR(1,  "CONSUMER:CONSUMER_BROWSER_FORWARD")
+DSTR(2,  "CONSUMER:MEDIA_NEXT")
+DSTR(3,  "CONSUMER:MEDIA_PLAY_PAUSE")
+DSTR(4,  "CONSUMER:MEDIA_PREVIOUS")
+DSTR(5,  "CONSUMER:MEDIA_VOLUME_DOWN")
+DSTR(6,  "CONSUMER:MEDIA_VOLUME_MUTE")
+DSTR(7,  "CONSUMER:MEDIA_VOLUME_UP")
+DSTR(8,  "CTRL+ALT+SHIFT+ENTER")
+DSTR(9,  "CTRL+ALT+SHIFT+v")
+DSTR(10, "CTRL+ALT+SHIFT+w")
+DSTR(11, "CTRL+ALT+i")
+DSTR(12, "CTRL+PAGE_DOWN")
+DSTR(13, "CTRL+PAGE_UP")
+DSTR(14, "CTRL+SHIFT+F9")
+DSTR(15, "CTRL+V")
+DSTR(16, "CTRL+a")
+DSTR(17, "CTRL+c")
+DSTR(18, "CTRL+f")
+DSTR(19, "CTRL+s")
+DSTR(20, "CTRL+t")
+DSTR(21, "CTRL+v")
+DSTR(22, "CTRL+w")
+DSTR(23, "CTRL+x")
+DSTR(24, "DOWN")
+DSTR(25, "ENTER")
+DSTR(26, "F5")
+DSTR(27, "LEFT")
+DSTR(28, "RIGHT")
+DSTR(29, "SEQ:[\"CTRL+ALT+SHIFT+BACKSPACE\",\"RIGHT\",\"DOWN\",\"RIGHT\",\"DOWN\",\"ENTER\"]")
+DSTR(30, "SEQ:[\"CTRL+k\",\"c\"]")
+DSTR(31, "SEQ:[\"CTRL+k\",\"k\"]")
+DSTR(32, "SEQ:[\"CTRL+k\",\"l\"]")
+DSTR(33, "SEQ:[\"CTRL+k\",\"u\"]")
+DSTR(34, "SEQ:[\"ENTER\",\"TEXT:XD\"]")
+DSTR(35, "TEXT:230998")
+DSTR(36, "TEXT:Alpha key12")
+DSTR(37, "TEXT:close one")
+DSTR(38, "TEXT:defending")
+DSTR(39, "TEXT:i got it")
+DSTR(40, "TEXT:my bad")
+DSTR(41, "TEXT:nice shot")
+DSTR(42, "TEXT:nooooo!")
+DSTR(43, "TEXT:take the shot")
+DSTR(44, "TEXT:thanks")
+DSTR(45, "UP")
+#undef DSTR
+
+// Array of PROGMEM pointers
+static const char* const DictPROGMEM[] PROGMEM = {
+  d_0,d_1,d_2,d_3,d_4,d_5,d_6,d_7,d_8,d_9,d_10,d_11,d_12,d_13,d_14,d_15,d_16,d_17,d_18,d_19,d_20,d_21,d_22,d_23,
+  d_24,d_25,d_26,d_27,d_28,d_29,d_30,d_31,d_32,d_33,d_34,d_35,d_36,d_37,d_38,d_39,d_40,d_41,d_42,d_43,d_44,d_45
+};
+static const uint16_t DictPROGMEM_Count = sizeof(DictPROGMEM)/sizeof(DictPROGMEM[0]);
+
+// Built-in maps (same as your packed.json numbers). 0xFF means "no action".
+static const uint8_t K_Default[4][16] PROGMEM = {
+/* mode 0 */ {17,23,18,26,13,12,22,20,  0,1,21,16,36,19,6,3},
+/* mode 1 */ {17,15,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,9,8,29,0xFF,0xFF,25},
+/* mode 2 */ {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, 0xFF,11,10,0xFF,0xFF,0xFF,0xFF,0xFF},
+/* mode 3 */ {14,41,30,33,44,39,43,38, 31,32,30,40,42,37,35,34}
+};
+
+static const uint8_t E_Default[4][4] PROGMEM = {
+/* mode 0 */ {5,7,4,2},   // A+,A-,B+,B-
+/* mode 1 */ {27,28,45,24},
+/* mode 2 */ {27,28,27,28},
+/* mode 3 */ {24,45,24,45}
+};
+
+// Copy defaults from PROGMEM to RAM maps; use PROGMEM dict by flag.
+static bool useProgmemDict = false;
+static void loadBuiltInDefaultsToRAM() {
+  memcpy_P(K, K_Default, sizeof(K));
+  memcpy_P(Emap, E_Default, sizeof(Emap));
+  dictCount = DictPROGMEM_Count;
+  useProgmemDict = true;
+  hostConfigLoaded = false;
+}
+
+// =============== Host apply (BINCFG payload) ===============
 static bool applyPackedConfig(const uint8_t* buf, size_t len) {
-  freeConfigPool();
+  freeHostPool();
 
   if (len < sizeof(PackedHeader) + sizeof(K) + sizeof(Emap)) return false;
   const PackedHeader* h = (const PackedHeader*)buf;
@@ -105,35 +178,37 @@ static bool applyPackedConfig(const uint8_t* buf, size_t len) {
   memcpy(Emap, buf + off, sizeof(Emap)); off += sizeof(Emap);
 
   dictCount = h->dictCount;
-  if (dictCount > (uint16_t)(sizeof(Dict)/sizeof(Dict[0]))) return false;
-
-  // remaining bytes = concatenated zero-terminated UTF-8 strings
+  if (dictCount > 128) return false;
   if (off > len) return false;
+
+  // Remaining bytes = NUL-terminated strings pool
   size_t poolLen = len - off;
   strPool = (char*)malloc(poolLen + 1);
   if (!strPool) return false;
   memcpy(strPool, buf + off, poolLen);
   strPool[poolLen] = 0;
 
-  // Build Dict[] pointers by walking the pool
+  // Build DictRAM[] pointers
   char* p = strPool;
   for (uint16_t i = 0; i < dictCount; i++) {
-    Dict[i] = p;
+    DictRAM[i] = p;
     while (*p) p++;
     p++; // skip NUL
-    if ((size_t)(p - strPool) > poolLen + 1) return false;
+    if ((size_t)(p - strPool) > poolLen + 1) { freeHostPool(); return false; }
   }
+
+  hostConfigLoaded = true;
+  useProgmemDict = false;
   return true;
 }
 
-// Wait briefly at boot for host to push a config
+// =============== Boot wait for host push ===============
 static bool waitForHostConfig(unsigned long ms_timeout = 6000) {
   Serial.begin(115200);
   unsigned long t0 = millis();
   while (!Serial && (millis() - t0) < 1500) { /* wait for USB */ }
-  Serial.println(F("READY")); // host looks for this banner
+  Serial.println(F("READY")); // host listens for this
 
-  // Expect a line: BINCFG <len>\n  then <len> raw bytes
   String line;
   while (millis() - t0 < ms_timeout) {
     while (Serial.available()) {
@@ -151,9 +226,7 @@ static bool waitForHostConfig(unsigned long ms_timeout = 6000) {
           while (got < n && millis() < to) {
             if (Serial.available()) { buf[got++] = (uint8_t)Serial.read(); to = millis()+4000; }
           }
-          if (got != n) { Serial.println(F("ERR timeout")); free(buf); return false; }
-
-          bool ok = applyPackedConfig(buf, (size_t)n);
+          bool ok = (got == n) && applyPackedConfig(buf, (size_t)n);
           free(buf);
           Serial.println(ok ? F("SAVED") : F("ERR parse"));
           return ok;
@@ -165,12 +238,11 @@ static bool waitForHostConfig(unsigned long ms_timeout = 6000) {
         line += c;
       }
     }
-    if (millis() - t0 > ms_timeout) break;
   }
   return false; // nothing received
 }
 
-// -------------------- Action runner --------------------
+// ============================= Actions =============================
 static uint8_t mapKeyToken(const String& t) {
   String s = t; s.toUpperCase();
   if (s.length()==1) { char c = s[0]; if (c>='A' && c<='Z') return (uint8_t)c; }
@@ -248,21 +320,33 @@ static void runAction(const String& spec) {
   runSingleAction(s);
 }
 
-// -------------------- Resolve actions from RAM maps --------------------
+// ===== Dict lookup (handles PROGMEM or host RAM) =====
+static String dictString(uint8_t idx) {
+  if (idx==0xFF || idx>=dictCount) return String("");
+  if (hostConfigLoaded) {
+    const char* p = DictRAM[idx];
+    return p ? String(p) : String("");
+  } else {
+    // Fetch PROGMEM pointer then copy to temp buffer
+    PGM_P p = (PGM_P)pgm_read_ptr(&DictPROGMEM[idx]);
+    static char buf[192]; // long enough for longest sequence/text above
+    strcpy_P(buf, p);
+    return String(buf);
+  }
+}
+
+// ===== Resolve actions from maps =====
 static int keyLabelToIndex(char label) {
   if (label >= '0' && label <= '9') return label - '0';
   if (label >= 'A' && label <= 'F') return 10 + (label - 'A');
   if (label >= 'a' && label <= 'f') return 10 + (label - 'a');
   return -1;
 }
-static const char* dictAt(uint8_t idx) {
-  return (idx != 0xFF && idx < dictCount) ? Dict[idx] : nullptr;
-}
 static String getKeyAction(uint8_t mode, char keyLabel) {
   int ix = keyLabelToIndex(keyLabel);
   if (ix < 0) return String("");
-  const char* s = dictAt(K[mode][ix]);
-  return s ? String(s) : String("");
+  uint8_t di = K[mode][ix];
+  return dictString(di);
 }
 static String getEncoderAction(uint8_t mode, const char* which) {
   int slot = (which[0]=='A' && which[1]=='+') ? 0 :
@@ -270,11 +354,11 @@ static String getEncoderAction(uint8_t mode, const char* which) {
              (which[0]=='B' && which[1]=='+') ? 2 :
              (which[0]=='B' && which[1]=='-') ? 3 : -1;
   if (slot < 0) return String("");
-  const char* s = dictAt(Emap[mode][slot]);
-  return s ? String(s) : String("");
+  uint8_t di = Emap[mode][slot];
+  return dictString(di);
 }
 
-// -------------------- Original helpers --------------------
+// ============================= Helpers =============================
 static void checkModeButton(){
   buttonState = digitalRead(ModeButton);
   if (buttonState != lastButtonState) {
@@ -312,42 +396,14 @@ static void handleKey(char key) {
   if (act.length()) { runAction(act); delay(80); Keyboard.releaseAll(); }
 }
 
-// -------------------- Tiny fallback (if host didn't send) --------------------
-// This is intentionally tiny so RAM stays low. Adjust if you want defaults.
-static void loadFallbackDefaults() {
-  // Clear maps
-  for (uint8_t m=0;m<4;m++){ for(uint8_t i=0;i<16;i++) K[m][i]=0xFF; for(uint8_t s=0;s<4;s++) Emap[m][s]=0xFF; }
-
-  // Very small dict (expand if you like)
-  static const char* d[] = {
-    "CTRL+c","CTRL+x","CTRL+f","F5","CTRL+v","ENTER",
-    "CONSUMER:MEDIA_VOLUME_UP","CONSUMER:MEDIA_VOLUME_DOWN"
-  };
-  for (uint8_t i=0;i<sizeof(d)/sizeof(d[0]);i++) Dict[i]=d[i];
-  dictCount = sizeof(d)/sizeof(d[0]);
-
-  // Mode 0 a few examples
-  K[0][0] = 0; // '0' -> CTRL+c
-  K[0][1] = 1; // '1' -> CTRL+x
-  K[0][2] = 2; // '2' -> CTRL+f
-  K[0][3] = 3; // '3' -> F5
-  K[0][10] = 4; // 'A' -> CTRL+v
-  K[1][15] = 5; // mode1 'F' -> ENTER
-
-  Emap[0][0] = 7; // mode0 A+ -> VOL DOWN
-  Emap[0][1] = 6; // mode0 A- -> VOL UP
-}
-
-// -------------------- Setup / Loop --------------------
+// ============================= Setup / Loop =============================
 void setup() {
-  // Option: require the host only when holding the Mode button:
   pinMode(ModeButton, INPUT_PULLUP);
+
+  // If mode button held at boot, wait longer for host push
   bool got = false;
-  if (digitalRead(ModeButton) == LOW) {
-    got = waitForHostConfig(10000); // wait longer if button held
-  } else {
-    got = waitForHostConfig(3000);  // short wait otherwise
-  }
+  if (digitalRead(ModeButton) == LOW) got = waitForHostConfig(10000);
+  else                                got = waitForHostConfig(3000);
 
   // Init hardware
   pinMode(LED_BUILTIN,OUTPUT);
@@ -359,9 +415,10 @@ void setup() {
   Consumer.begin();
   Mouse.begin();
 
-  if (!got || dictCount == 0) {
-    // No host config received -> minimal defaults
-    loadFallbackDefaults();
+  if (!got) {
+    loadBuiltInDefaultsToRAM(); // use PROGMEM dict + RAM maps
+  } else {
+    // Host config loaded to RAM already
   }
 }
 
